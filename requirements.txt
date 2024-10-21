@@ -1,7 +1,13 @@
-requests~=2.31.0
+requests~=2.32.3
 flask~=3.0.3
 torch~=2.3.0
 pillow~=10.3.0
 litserve~=0.2.2
 torchvision~=0.18.0
 fastapi~=0.112.2
+psutil~=5.9.0
+pydantic~=2.8.2
+prometheus_client~=0.14.1
+starlette~=0.38.2
+urllib3~=2.2.1
+aiohttp~=3.10.10
