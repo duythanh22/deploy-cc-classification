@@ -15,8 +15,8 @@ class Config:
     FLASK_HOST = '0.0.0.0'
     FLASK_PORT = 5000
     FLASK_DEBUG = False  # Set to False in production
-    API_URL = "https://8000-01japfr01tfg2q9519th36eftb.cloudspaces.litng.ai"
-    # API_URL = 'http://127.0.0.1:8000/predict'
+    # API_URL = "https://8000-01japfr01tfg2q9519th36eftb.cloudspaces.litng.ai/predict"
+    API_URL = 'http://127.0.0.1:8000/predict'
     SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or generate_secret_key()
 
     # Prometheus Configuration

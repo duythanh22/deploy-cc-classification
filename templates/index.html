@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cervical Cell Classifier</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
+    <link href="{{ url_for('static', filename='styles.css') }}" rel="stylesheet">
+</head>
+<body class="bg-gray-100 min-h-screen flex items-center justify-center">
+    <div class="bg-white p-8 rounded-lg shadow-md w-full max-w-5xl">
+        <!-- Main Title -->
+        <h1 class="text-4xl font-bold mb-6 text-center text-gray-800">Cervical Cell Classifier</h1>
+
+        <div class="flex flex-col lg:flex-row space-y-8 lg:space-y-0 lg:space-x-8">
+            <!-- Upload Image Section -->
+            <div class="w-full lg:w-1/2 bg-gray-50 p-6 rounded-lg shadow-inner">
+                <h2 class="text-2xl font-semibold mb-4 text-center text-gray-700">Upload Image</h2>
+                <form id="uploadForm" class="space-y-4" enctype="multipart/form-data">
+                    <div class="flex items-center justify-center w-full">
+                        <label for="image-upload" class="drop-zone cursor-pointer border-dashed border-2 border-gray-300 p-6 rounded-lg">
+                            <div class="flex flex-col items-center justify-center pt-5 pb-6">
+                                <svg class="w-10 h-10 mb-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
+                                </svg>
+                                <p class="mb-2 text-sm text-gray-500"><span class="font-semibold">Click to upload</span> or drag and drop</p>
+                                <p class="text-xs text-gray-500">PNG, JPG, JPEG up to 5MB</p>
+                            </div>
+                            <input id="image-upload" type="file" name="image" accept="image/*" required class="hidden" />
+                        </label>
+                    </div>
+                    <button type="submit" class="w-full bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">
+                        Predict Image
+                    </button>
+                </form>
+            </div>
+            <!-- Results Section -->
+            <div class="w-full lg:w-1/2 bg-gray-50 p-6 rounded-lg shadow-inner">
+                <h2 class="text-2xl font-semibold mb-4 text-center text-gray-700">Classify</h2>
+
+                <!-- Loading Indicator -->
+                <div id="loading" class="hidden mt-4 text-center">
+                    <p>Processing image...</p>
+                </div>
+
+                <!-- Results Section -->
+                <div id="results" class="hidden mt-6 p-4 bg-green-100 rounded-lg flex flex-col items-center justify-center">
+                    <!-- Uploaded Image Preview -->
+                    <div id="imagePreview" class="hidden mt-4 flex flex-col items-center justify-center">
+                        <h2 class="text-xl font-semibold text-gray-800">Uploaded Image:</h2>
+                        <img id="uploadedImage" class=" preview-image mt-2 max-w-full h-auto rounded-lg shadow-md" alt="Uploaded Image Preview"/>
+                    </div>
+
+                    <!-- Prediction Result -->
+                    <h2 class="text-2xl font-semibold text-green-800 mt-4">Prediction: <span id="prediction" class="font-bold"></span></h2>
+                    <div id="confidenceScore" class="text-lg mt-2">
+                        Confidence: <span id="confidence" class="font-semibold text-green-600"></span>
+                    </div>
+
+                    <!-- Toggle for Probabilities -->
+                    <button id="toggleProbabilities" class="mt-4 bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">
+                        Show Probabilities
+                    </button>
+
+                    <!-- Graphical Probability Display -->
+                    <div id="probabilitiesContent" class="hidden mt-6 w-full">
+                        <h3 class="text-lg font-semibold text-green-800 mb-4 text-center">Class Probabilities:</h3>
+                        <canvas id="probabilityChart" class="w-full h-64"></canvas>
+                    </div>
+                </div>
+
+                <!-- Error Display -->
+                <div id="error" class="hidden mt-6 p-4 bg-red-100 rounded-lg">
+                    <p class="text-red-700"></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
