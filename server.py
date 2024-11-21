@@ -9,15 +9,16 @@ from fastapi import Depends, HTTPException, UploadFile, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from litserve.utils import PickleableHTTPException
 from litserve.middlewares import MaxSizeMiddleware
-from prometheus_fastapi_instrumentator import Instrumentator
 from config.config import config
 from utils.callbacks import PredictTimeLogger
 from monitor.monitor import start_monitoring_server, monitor_requests
 from typing import List
 import sys
-from prometheus_client import CollectorRegistry, Histogram, make_asgi_app, multiprocess
+from prometheus_client import CollectorRegistry, Histogram, Gauge, make_asgi_app, multiprocess
 import litserve
 import time
+import psutil
+import torch.cuda as cuda
 
 # Set the directory for multiprocess mode
 os.environ["PROMETHEUS_MULTIPROC_DIR"] = "/tmp/prometheus_multiproc_dir"
@@ -42,12 +43,42 @@ transform = transforms.Compose([
 class PrometheusLogger(litserve.Logger):
     def __init__(self):
         super().__init__()
+        # Existing histogram for request processing time
         self.function_duration = Histogram("request_processing_seconds", "Time spent processing request",
                                            ["function_name"], registry=registry)
 
+        # New Gauges for memory metrics
+        self.model_memory_usage = Gauge(
+            "model_memory_usage_bytes",
+            "Memory used by the model",
+            ["device_type"],
+            registry=registry
+        )
+
+        self.system_memory_usage = Gauge(
+            "system_memory_usage_bytes",
+            "Overall system memory usage",
+            ["memory_type"],
+            registry=registry
+        )
+
     def process(self, key, value):
         print("processing", key, value)
+        # Existing time processing
         self.function_duration.labels(function_name=key).observe(value)
+
+        # Process memory metrics if they are memory-related
+        if key == "model_memory_allocated":
+            self.model_memory_usage.labels(device_type="gpu" if cuda.is_available() else "cpu").set(value)
+        elif key == "model_memory_peak":
+            self.model_memory_usage.labels(device_type="gpu_peak" if cuda.is_available() else "cpu_peak").set(value)
+        elif key == "system_memory_total":
+            self.system_memory_usage.labels(memory_type="total").set(value)
+        elif key == "system_memory_available":
+            self.system_memory_usage.labels(memory_type="available").set(value)
+        elif key == "system_memory_used":
+            self.system_memory_usage.labels(memory_type="used").set(value)
+
 
 class CervicalCellClassifierAPI(ls.LitAPI):
     security = HTTPBearer()
@@ -97,33 +128,58 @@ class CervicalCellClassifierAPI(ls.LitAPI):
             logger.info("Starting prediction...")
             start_time = time.time()
 
-            # Dự đoán
             with torch.inference_mode():
                 output = self.model(x)
                 probabilities = torch.nn.functional.softmax(output, dim=1)
                 _, predicted = torch.max(output.data, 1)
 
-            # Đo thời gian hoàn thành
             end_time = time.time()
             time_taken = end_time - start_time
 
-            # Ghi nhận mức sử dụng bộ nhớ
+            # Memory usage tracking
             try:
-                allocated, peak = self.engine.get_memory_usage() if hasattr(self, "engine") else (None, None)
+                # Model memory usage (GPU or CPU)
+                if cuda.is_available():
+                    allocated = cuda.memory_allocated(self.device) / (1024 ** 3)  # Convert to GB
+                    peak = cuda.max_memory_allocated(self.device) / (1024 ** 3)  # Convert to GB
+                else:
+                    allocated = None
+                    peak = None
+
+                # System memory usage
+                process = psutil.Process(os.getpid())
+                system_memory_total = psutil.virtual_memory().total
+                system_memory_available = psutil.virtual_memory().available
+                system_memory_used = psutil.virtual_memory().used
+                process_memory = process.memory_info().rss
+
+                # Log memory metrics
+                if hasattr(self, "log"):
+                    if allocated is not None:
+                        self.log("model_memory_allocated",
+                                 allocated * (1024 ** 3))  # Convert back to bytes for Prometheus
+                        self.log("model_memory_peak", peak * (1024 ** 3))
+
+                    self.log("system_memory_total", system_memory_total)
+                    self.log("system_memory_available", system_memory_available)
+                    self.log("system_memory_used", system_memory_used)
+
+                # Logging for local debugging
+                logger.info(f"Prediction completed in {time_taken:.4f} seconds.")
+                if allocated is not None and peak is not None:
+                    logger.info(f"Model Memory usage - Allocated: {allocated:.2f} GB, Peak: {peak:.2f} GB")
+                logger.info(f"System Memory - Total: {system_memory_total / (1024 ** 3):.2f} GB, "
+                            f"Available: {system_memory_available / (1024 ** 3):.2f} GB, "
+                            f"Used: {system_memory_used / (1024 ** 3):.2f} GB")
+                logger.debug(f"Predicted labels: {predicted.tolist()}")
+                logger.debug(f"Probabilities: {probabilities.tolist()}")
+
+                # Log inference time
+                if hasattr(self, "log"):
+                    self.log("inference_time", time_taken)
+
             except Exception as mem_err:
                 logger.warning(f"Failed to retrieve memory usage: {str(mem_err)}")
-                allocated, peak = None, None
-
-            # Log thông tin
-            logger.info(f"Prediction completed in {time_taken:.4f} seconds.")
-            if allocated is not None and peak is not None:
-                logger.info(f"Memory usage - Allocated: {allocated:.2f} GB, Peak: {peak:.2f} GB")
-            logger.debug(f"Predicted labels: {predicted.tolist()}")
-            logger.debug(f"Probabilities: {probabilities.tolist()}")
-
-            # Ghi số liệu vào Prometheus (nếu có Histogram)
-            if hasattr(self, "log"):
-                self.log("inference_time", time_taken)
 
             return predicted, probabilities
 
@@ -184,10 +240,10 @@ if __name__ == '__main__':
     )
     try:
         api = CervicalCellClassifierAPI()
-        server = ls.LitServer(api)
+        server = ls.LitServer(api, loggers=prometheus_logger)
 
         server.app.mount("/api/v1/metrics", make_asgi_app(registry=registry))
-
+        server.app.add_middleware(MaxSizeMiddleware, max_size=config.MAX_IMAGE_SIZE)
         logger.info("Starting server on port 8000")
         server.run(port=config.SERVER_PORT)
 
