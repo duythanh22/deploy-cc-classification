@@ -1,142 +1,118 @@
 import torch
 import PIL
 import os
-import logging
-import sys
-import time
-import threading
-import psutil
-
+from loguru import logger
 import litserve as ls
+from torchvision import transforms
+from fastapi import Depends, HTTPException, UploadFile, Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from litserve.utils import PickleableHTTPException
 from litserve.middlewares import MaxSizeMiddleware
-
-from fastapi import Depends, HTTPException, UploadFile
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-
-from torchvision import transforms
-from prometheus_client import (
-    CollectorRegistry,
-    Counter,
-    Histogram,
-    Gauge,
-    make_asgi_app,
-    multiprocess
-)
-
-from loguru import logger
+from config.config import config
+from typing import List
+import sys
+from prometheus_client import CollectorRegistry, Histogram, Gauge, make_asgi_app, multiprocess, Counter
+import litserve
+import time
+import psutil
 import torch.cuda as cuda
 
-# Import your configuration (assumed to exist)
-from config.config import config
+# Set the directory for multiprocess mode
+os.environ["PROMETHEUS_MULTIPROC_DIR"] = "/tmp/prometheus_multiproc_dir"
+
+# Ensure the directory exists
+if not os.path.exists("/tmp/prometheus_multiproc_dir"):
+    os.makedirs("/tmp/prometheus_multiproc_dir")
+
+# Use a multiprocess registry
+registry = CollectorRegistry()
+multiprocess.MultiProcessCollector(registry)
+
+# Define transformations and class names
+class_name = config.CLASS_NAMES
+transform = transforms.Compose([
+    transforms.Resize(config.IMAGE_INPUT_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=config.IMAGE_MEAN, std=config.IMAGE_STD)
+])
 
 
-class PrometheusMonitor(ls.Logger):
+class PrometheusLogger(litserve.Logger):
     def __init__(self):
         super().__init__()
-        # Request Metrics
-        self.requests_total = Counter(
-            "api_requests_total",
-            "Total number of API requests",
-            ["endpoint", "method", "status_code"],
-            registry=registry
-        )
-        self.request_duration = Histogram(
-            "api_request_duration_seconds",
-            "API request latency",
-            ["endpoint", "method"],
-            buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
-            registry=registry
-        )
-        self.active_requests = Gauge(
-            "api_active_requests",
-            "Number of currently processing requests",
-            registry=registry
+
+        # Timing metrics
+        self.function_duration = Histogram(
+            "request_processing_seconds",
+            "Time spent processing request",
+            ["function_name"], registry=registry
         )
 
-        # Model Metrics
+        # Request metrics
+        self.api_requests = Counter(
+            "api_requests_total",
+            "Total API requests handled",
+            ["endpoint", "method", "status"], registry=registry
+        )
+
+        self.api_response_time = Histogram(
+            "api_response_time_seconds",
+            "Response time of API endpoints",
+            ["endpoint"], registry=registry
+        )
+
+        # Model prediction metrics
         self.model_predictions = Counter(
             "model_predictions_total",
             "Total number of model predictions",
-            ["predicted_class", "confidence_level"],
-            registry=registry
+            ["predicted_class", "confidence_level"], registry=registry
         )
 
-        # Error Metrics
-        self.errors_total = Counter(
-            "api_errors_total",
-            "Total number of API errors",
-            ["error_type", "endpoint"],
-            registry=registry
-        )
-
-        # Resource Metrics
-        self.cpu_usage = Gauge(
-            "process_cpu_usage_percent",
-            "CPU usage of the API process",
-            registry=registry
-        )
-        self.memory_usage = Gauge(
-            "process_memory_usage_bytes",
-            "Memory usage of the API process",
-            registry=registry
-        )
-        self.file_descriptors = Gauge(
-            "process_open_file_descriptors",
-            "Number of open file descriptors",
-            registry=registry
-        )
-        self.thread_count = Gauge(
-            "process_threads",
-            "Number of threads in the process",
-            registry=registry
-        )
         self.model_memory_usage = Gauge(
             "model_memory_usage_bytes",
             "Memory used by the model",
-            ["device_type"],
-            registry=registry
+            ["device_type"], registry=registry
+        )
+
+        self.system_memory_usage = Gauge(
+            "system_memory_usage_bytes",
+            "Overall system memory usage",
+            ["memory_type"], registry=registry
+        )
+
+        self.cpu_usage = Gauge(
+            "cpu_usage_percent",
+            "CPU usage by the process and system",
+            ["cpu_type"], registry=registry
         )
 
     def process(self, key, value):
-        """Process incoming metrics"""
         try:
-            if key == "http_request":
-                endpoint, method, status_code, duration = value
-                # Increment total requests counter
-                self.requests_total.labels(
-                    endpoint=endpoint,
-                    method=method,
-                    status_code=status_code
-                ).inc()
-                # Record request duration
-                self.request_duration.labels(
-                    endpoint=endpoint,
-                    method=method
-                ).observe(duration)
+            # Log processing based on the key
+            if key == "model_prediction":
+                predicted_class, confidence = value  # Unpack the tuple
+                confidence_bucket = self._confidence_bucket(confidence)
 
-            elif key == "request_start":
-                self.active_requests.inc()
-
-            elif key == "request_end":
-                self.active_requests.dec()
-
-            elif key == "model_prediction":
-                predicted_class, confidence = value
+                # Increment the Counter by 1
                 self.model_predictions.labels(
                     predicted_class=predicted_class,
-                    confidence_level=self._confidence_bucket(confidence)
-                ).inc()
-
-            elif key == "error":
-                error_type, endpoint = value
-                self.errors_total.labels(
-                    error_type=error_type,
-                    endpoint=endpoint
-                ).inc()
-
+                    confidence_level=confidence_bucket
+                ).inc(1)
+            elif key == "model_memory_allocated":
+                self.model_memory_usage.labels(device_type="gpu" if cuda.is_available() else "cpu").set(value)
+            elif key == "model_memory_peak":
+                self.model_memory_usage.labels(device_type="gpu_peak" if cuda.is_available() else "cpu_peak").set(value)
+            elif key.startswith("system_memory_"):
+                memory_type = key.split("_")[-1]
+                self.system_memory_usage.labels(memory_type=memory_type).set(value)
+            elif key == "cpu_usage":
+                self.cpu_usage.labels(cpu_type="system").set(value["system"])
+                self.cpu_usage.labels(cpu_type="process").set(value["process"])
+            else:
+                self.function_duration.labels(function_name=key).observe(value)
         except Exception as e:
-            logger.error(f"Error processing metric {key}: {e}")
+            logger.error(
+                f"PrometheusLogger ran into an error while processing log for key {key} and value {value}: {e}")
 
     def _confidence_bucket(self, confidence):
         """Convert confidence to buckets"""
@@ -147,23 +123,6 @@ class PrometheusMonitor(ls.Logger):
         else:
             return "high"
 
-    def log_error(self, error_type, endpoint):
-        """Log API errors"""
-        self.errors_total.labels(
-            error_type=error_type,
-            endpoint=endpoint
-        ).inc()
-
-
-# Set up Prometheus multiprocess registry
-os.environ["PROMETHEUS_MULTIPROC_DIR"] = "/tmp/prometheus_multiproc_dir"
-if not os.path.exists("/tmp/prometheus_multiproc_dir"):
-    os.makedirs("/tmp/prometheus_multiproc_dir")
-
-registry = CollectorRegistry()
-multiprocess.MultiProcessCollector(registry)
-
-
 class CervicalCellClassifierAPI(ls.LitAPI):
     security = HTTPBearer()
 
@@ -171,99 +130,122 @@ class CervicalCellClassifierAPI(ls.LitAPI):
         self.device = devices[0] if isinstance(devices, list) else devices
         try:
             self.model = torch.load(config.MODEL_PATH, map_location=self.device)
-            self.model.eval()
-            logger.info("Model loaded successfully")
+            logger.info("Setup completed successfully")
         except Exception as e:
-            if hasattr(self, "log"):
-                self.log("error", ("model_load_error", "setup"))
-            logger.error(f"Model loading failed: {e}")
-            raise PickleableHTTPException(status_code=500, detail=f"Model load error: {e}")
+            logger.error(f"Failed to load model: {str(e)}")
+            raise PickleableHTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
+        self.model.eval()
 
     def decode_request(self, request: UploadFile, **kwargs) -> torch.Tensor:
-        start_time = time.time()
         try:
-            # Record request start
-            if hasattr(self, "log"):
-                self.log("request_start", None)
-
             image = PIL.Image.open(request.file)
+
             file_ext = os.path.splitext(request.filename)[1].lower()
-
             if file_ext not in ['.png', '.jpg', '.jpeg']:
-                if hasattr(self, "log"):
-                    self.log("error", ("invalid_format", "decode_request"))
-                raise PickleableHTTPException(status_code=400, detail=f"Unsupported format: {file_ext}")
+                raise PickleableHTTPException(status_code=400,
+                                              detail=f"Unsupported image format: {file_ext}")
 
-            # Process image...
             image = image.convert("RGB")
+
             image = image.resize(config.IMAGE_INPUT_SIZE, PIL.Image.NEAREST)
-            tensor_image = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(mean=config.IMAGE_MEAN, std=config.IMAGE_STD)
-            ])(image)
+
+            tensor_image = transforms.ToTensor()(image)
+            tensor_image = transforms.Normalize(
+                mean=config.IMAGE_MEAN,
+                std=config.IMAGE_STD
+            )(tensor_image)
 
             return tensor_image.unsqueeze(0).to(self.device, non_blocking=True)
 
-        except Exception as e:
-            if hasattr(self, "log"):
-                self.log("error", (type(e).__name__, "decode_request"))
+        except PickleableHTTPException:
             raise
-        finally:
-            # Record HTTP request metrics
-            duration = time.time() - start_time
-            if hasattr(self, "log"):
-                self.log("http_request", ("/predict", "POST", 200, duration))
-                self.log("request_end", None)
+        except Exception as e:
+            logger.error(f"Error in decode_request: {e}")
+            raise PickleableHTTPException(status_code=500, detail="Image processing failed")
+
+    def batch(self, inputs: List[torch.Tensor]) -> torch.Tensor:
+        return torch.cat(inputs, dim=0).to(self.device)
 
     def predict(self, x: torch.Tensor, **kwargs):
-        start_time = time.time()
         try:
-            if hasattr(self, "log"):
-                self.log("request_start", None)
+            logger.info("Starting prediction...")
+            start_time = time.time()
 
             with torch.inference_mode():
                 output = self.model(x)
                 probabilities = torch.nn.functional.softmax(output, dim=1)
                 _, predicted = torch.max(output.data, 1)
 
+            end_time = time.time()
+            time_taken = end_time - start_time
+
+            # Memory and system metrics
+            try:
+                if cuda.is_available():
+                    allocated = cuda.memory_allocated(self.device) / (1024 ** 3)  # Convert to GB
+                    peak = cuda.max_memory_allocated(self.device) / (1024 ** 3)  # Convert to GB
+                else:
+                    allocated = None
+                    peak = None
+
+                process = psutil.Process(os.getpid())
+                cpu_usage = {
+                    "system": psutil.cpu_percent(interval=None),
+                    "process": process.cpu_percent(interval=None)
+                }
+
+                self.log("cpu_usage", cpu_usage)
+                self.log("system_memory_total", psutil.virtual_memory().total)
+                self.log("system_memory_available", psutil.virtual_memory().available)
+                self.log("system_memory_used", psutil.virtual_memory().used)
+
+                if allocated is not None:
+                    self.log("model_memory_allocated", allocated * (1024 ** 3))  # Convert back to bytes
+                    self.log("model_memory_peak", peak * (1024 ** 3))
+
+            except Exception as mem_err:
+                logger.warning(f"Failed to retrieve system metrics: {mem_err}")
+
+            # Log inference time
+            self.log("inference_time", time_taken)
+
             # Log prediction metrics
             predicted_class = config.CLASS_NAMES[predicted.item()]
             confidence = probabilities[0][predicted.item()].item()
+            self.log("model_prediction", (predicted_class, confidence))
 
-            if hasattr(self, "log"):
-                self.log("model_prediction", (predicted_class, confidence))
+            logger.info(f"Prediction completed in {time_taken:.4f} seconds")
+            logger.debug(f"Predicted class: {predicted_class}, Confidence: {confidence:.4f}")
 
             return predicted, probabilities
 
         except Exception as e:
-            if hasattr(self, "log"):
-                self.log("error", (type(e).__name__, "predict"))
-            raise
-        finally:
-            duration = time.time() - start_time
-            if hasattr(self, "log"):
-                self.log("http_request", ("/predict", "POST", 200, duration))
-                self.log("request_end", None)
+            logger.error(f"Error during prediction: {e}")
+            raise PickleableHTTPException(status_code=500, detail="Prediction failed")
+
+    def unbatch(self, output):
+        predicted, probabilities = output
+        return list(zip(predicted, probabilities))
 
     def encode_response(self, output, **kwargs):
         predicted_label, probabilities = output
 
         def process_prediction(label, probs):
             label_idx = label.item()
-            predicted_class = config.CLASS_NAMES[label_idx]
-            class_probabilities = {
-                config.CLASS_NAMES[i]: prob.item()
-                for i, prob in enumerate(probs)
-            }
-            confidence_score = probs[label_idx].item()
+            if 0 <= label_idx < len(class_name):
+                predicted_class = class_name[label_idx]
+                class_probabilities = {class_name[i]: prob.item() for i, prob in enumerate(probs)}
+                confidence_score = probs[label_idx].item()
 
-            return {
-                "predicted_class": predicted_class,
-                "class_probabilities": class_probabilities,
-                "confidence_score": confidence_score
-            }
+                return {
+                    "predicted_class": predicted_class,
+                    "class_probabilities": class_probabilities,
+                    "confidence_score": confidence_score
+                }
 
-        # Handle batch or single prediction
+            logger.error(f"Invalid prediction index: {label_idx}")
+            raise PickleableHTTPException(status_code=500, detail="Invalid model prediction")
+
         if predicted_label.dim() > 0:
             return [process_prediction(label, probs) for label, probs in zip(predicted_label, probabilities)]
         else:
@@ -272,52 +254,18 @@ class CervicalCellClassifierAPI(ls.LitAPI):
     def authorize(self, credentials: HTTPAuthorizationCredentials = Depends(security)):
         token = credentials.credentials
         if token != config.API_AUTH_TOKEN:
-            raise HTTPException(status_code=401, detail="Invalid token")
+            raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 
-def periodic_resource_monitor(monitor):
-    """Background thread for periodic resource monitoring"""
-    while True:
-        try:
-            logger.debug("Resource monitor running")
-            process = psutil.Process()
-
-            # Update CPU metrics
-            monitor.cpu_usage.set(process.cpu_percent(interval=1))
-
-            # Update memory metrics
-            memory_info = process.memory_info()
-            monitor.memory_usage.set(memory_info.rss)
-
-            # Update file descriptor count
-            monitor.file_descriptors.set(process.num_fds())
-
-            # Update thread count
-            monitor.thread_count.set(process.num_threads())
-
-            # Update GPU metrics if available
-            if torch.cuda.is_available():
-                device = torch.device("cuda")
-                allocated = torch.cuda.memory_allocated(device)
-                peak = torch.cuda.max_memory_allocated(device)
-
-                monitor.model_memory_usage.labels(device_type="gpu_allocated").set(allocated)
-                monitor.model_memory_usage.labels(device_type="gpu_peak").set(peak)
-            else:
-                process_memory = process.memory_info().rss
-                monitor.model_memory_usage.labels(device_type="cpu_allocated").set(process_memory)
-
-        except Exception as e:
-            logger.error(f"Resource monitoring error: {e}")
-
-        time.sleep(15)  # Update every 15 seconds
-
-def configure_logging():
-    """Configure logging with Loguru"""
+if __name__ == '__main__':
+    prometheus_logger = PrometheusLogger()
+    # prometheus_logger.mount(path="/api/v1/metrics", app=make_asgi_app(registry=registry))
+    # Configure logging
     logger.remove()
     logger.add(
         sys.stdout,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{"
+               "function}</cyan> - <level>{message}</level>",
         level="INFO"
     )
     logger.add(
@@ -326,36 +274,15 @@ def configure_logging():
         retention="1 week",
         level="DEBUG"
     )
-
-
-def main():
-    configure_logging()
-
-    # Create monitor
-    prometheus_monitor = PrometheusMonitor()
-
-    # Start resource monitoring
-    monitor_thread = threading.Thread(
-        target=periodic_resource_monitor,
-        args=(prometheus_monitor,),
-        daemon=True
-    )
-    monitor_thread.start()
-
     try:
         api = CervicalCellClassifierAPI()
-        server = ls.LitServer(api, loggers=prometheus_monitor, track_requests=True)
+        server = ls.LitServer(api, loggers=prometheus_logger)
 
-        # Mount metrics endpoint
-        server.app.mount("/api/v1/metrics", make_asgi_app(registry=registry))
+        server.app.mount("/api/v2/metrics", make_asgi_app(registry=registry))
         server.app.add_middleware(MaxSizeMiddleware, max_size=config.MAX_IMAGE_SIZE)
-
-        logger.info(f"Starting server on port {config.SERVER_PORT}")
+        logger.info("Starting server on port 8000")
         server.run(port=config.SERVER_PORT)
 
     except Exception as e:
-        logger.error(f"Server startup failed: {e}")
+        logger.error(f"Server failed to start: {e}")
         sys.exit(1)
-
-if __name__ == "__main__":
-    main()

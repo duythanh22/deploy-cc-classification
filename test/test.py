@@ -7,7 +7,7 @@ class TestImageClassificationAPI(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.api_url = config.API_URL
-        cls.test_images_dir = r"T:/deploy-cc-classification/"
+        cls.test_images_dir = "/home/xeon-3/PycharmProjects/deploy-cc-classification/"
 
     def load_test_image(self, filename):
         filepath = os.path.join(self.test_images_dir, filename)
