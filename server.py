@@ -16,6 +16,8 @@ import litserve
 import time
 import psutil
 import torch.cuda as cuda
+from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi import Request, Response
 
 # Set the directory for multiprocess mode
 os.environ["PROMETHEUS_MULTIPROC_DIR"] = "/tmp/prometheus_multiproc_dir"
@@ -90,10 +92,9 @@ class PrometheusLogger(litserve.Logger):
         try:
             # Log processing based on the key
             if key == "model_prediction":
-                predicted_class, confidence = value  # Unpack the tuple
+                predicted_class, confidence = value
                 confidence_bucket = self._confidence_bucket(confidence)
 
-                # Increment the Counter by 1
                 self.model_predictions.labels(
                     predicted_class=predicted_class,
                     confidence_level=confidence_bucket
@@ -108,6 +109,18 @@ class PrometheusLogger(litserve.Logger):
             elif key == "cpu_usage":
                 self.cpu_usage.labels(cpu_type="system").set(value["system"])
                 self.cpu_usage.labels(cpu_type="process").set(value["process"])
+            elif key == "api_requests":
+                endpoint, method, status = value["endpoint"], value["method"], value["status"]
+                self.api_requests.labels(
+                    endpoint=endpoint,
+                    method=method,
+                    status=str(status)
+                ).inc(1)
+
+                if "response_time" in value:
+                    self.api_response_time.labels(
+                        endpoint=endpoint
+                    ).observe(value["response_time"])
             else:
                 self.function_duration.labels(function_name=key).observe(value)
         except Exception as e:
@@ -122,6 +135,34 @@ class PrometheusLogger(litserve.Logger):
             return "medium"
         else:
             return "high"
+
+
+class MetricsMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, prometheus_logger):
+        super().__init__(app)
+        self.prometheus_logger = prometheus_logger
+
+    async def dispatch(self, request: Request, call_next):
+        start_time = time.time()
+
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+        except Exception as e:
+            status_code = 500
+            raise e
+        finally:
+            process_time = time.time() - start_time
+
+            # Log the request metrics
+            self.prometheus_logger.process("api_requests", {
+                "endpoint": request.url.path,
+                "method": request.method,
+                "status": status_code,
+                "response_time": process_time
+            })
+
+        return response
 
 class CervicalCellClassifierAPI(ls.LitAPI):
     security = HTTPBearer()
@@ -258,8 +299,14 @@ class CervicalCellClassifierAPI(ls.LitAPI):
 
 
 if __name__ == '__main__':
+    # Clean up old metric files
+    multiprocess_dir = "/tmp/prometheus_multiproc_dir"
+    if os.path.exists(multiprocess_dir):
+        for file in os.listdir(multiprocess_dir):
+            os.remove(os.path.join(multiprocess_dir, file))
+
     prometheus_logger = PrometheusLogger()
-    # prometheus_logger.mount(path="/api/v1/metrics", app=make_asgi_app(registry=registry))
+
     # Configure logging
     logger.remove()
     logger.add(
@@ -274,12 +321,18 @@ if __name__ == '__main__':
         retention="1 week",
         level="DEBUG"
     )
+
     try:
         api = CervicalCellClassifierAPI()
         server = ls.LitServer(api, loggers=prometheus_logger)
 
-        server.app.mount("/api/v2/metrics", make_asgi_app(registry=registry))
+        # Add the metrics endpoint
+        server.app.mount("/api/v1/metrics", make_asgi_app(registry=registry))
+
+        # Add the middlewares
         server.app.add_middleware(MaxSizeMiddleware, max_size=config.MAX_IMAGE_SIZE)
+        server.app.add_middleware(MetricsMiddleware, prometheus_logger=prometheus_logger)
+
         logger.info("Starting server on port 8000")
         server.run(port=config.SERVER_PORT)
 
