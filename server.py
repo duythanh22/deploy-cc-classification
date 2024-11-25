@@ -4,7 +4,7 @@ import os
 from loguru import logger
 import litserve as ls
 from torchvision import transforms
-from fastapi import Depends, HTTPException, UploadFile, Response
+from fastapi import Depends, HTTPException, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from litserve.utils import PickleableHTTPException
 from litserve.middlewares import MaxSizeMiddleware
@@ -17,7 +17,7 @@ import time
 import psutil
 import torch.cuda as cuda
 from starlette.middleware.base import BaseHTTPMiddleware
-from fastapi import Request, Response
+from fastapi import Request
 
 # Set the directory for multiprocess mode
 os.environ["PROMETHEUS_MULTIPROC_DIR"] = "/tmp/prometheus_multiproc_dir"
@@ -40,6 +40,26 @@ transform = transforms.Compose([
 
 
 class PrometheusLogger(litserve.Logger):
+    """
+    A logger class that extends `litserve.Logger` to provide Prometheus metrics
+    for monitoring API requests, model predictions, and system resource usage.
+
+    Attributes:
+        function_duration (Histogram): Tracks the time spent processing requests.
+        api_requests (Counter): Counts the total API requests handled.
+        api_response_time (Histogram): Measures the response time of API endpoints.
+        model_predictions (Counter): Counts the total number of model predictions.
+        model_memory_usage (Gauge): Monitors memory usage by the model.
+        system_memory_usage (Gauge): Monitors overall system memory usage.
+        cpu_usage (Gauge): Tracks CPU usage by the process and system.
+
+    Methods:
+        process(key, value): Processes log entries and updates the corresponding
+            Prometheus metrics based on the key-value pairs.
+        _confidence_bucket(confidence): Converts confidence levels into predefined
+            buckets for categorization.
+    """
+
     def __init__(self):
         super().__init__()
 
@@ -127,7 +147,8 @@ class PrometheusLogger(litserve.Logger):
             logger.error(
                 f"PrometheusLogger ran into an error while processing log for key {key} and value {value}: {e}")
 
-    def _confidence_bucket(self, confidence):
+    @staticmethod
+    def _confidence_bucket(confidence):
         """Convert confidence to buckets"""
         if confidence < 0.5:
             return "low"
@@ -138,6 +159,23 @@ class PrometheusLogger(litserve.Logger):
 
 
 class MetricsMiddleware(BaseHTTPMiddleware):
+    """
+        Middleware for capturing and logging Prometheus metrics related to API requests.
+
+        This middleware intercepts incoming HTTP requests and logs metrics such as
+        request endpoint, HTTP method, status code, and response time using a Prometheus
+        logger.
+
+        Attributes:
+            prometheus_logger: An instance of a logger that processes and records
+                Prometheus metrics.
+
+        Methods:
+            dispatch(request, call_next):
+                Intercepts the request, measures processing time, and logs relevant
+                metrics. Passes the request to the next middleware or endpoint handler.
+    """
+
     def __init__(self, app, prometheus_logger):
         super().__init__(app)
         self.prometheus_logger = prometheus_logger
@@ -164,7 +202,43 @@ class MetricsMiddleware(BaseHTTPMiddleware):
 
         return response
 
+
 class CervicalCellClassifierAPI(ls.LitAPI):
+    """
+        API class for classifying cervical cell images using a pre-trained model.
+
+        This class extends `ls.LitAPI` and provides methods for setting up the model,
+        decoding incoming image requests, batching inputs, making predictions, and
+        encoding responses. It also includes authorization and logging of system
+        metrics and prediction details.
+
+        Attributes:
+            security: An instance of `HTTPBearer` for handling authorization.
+            device: The device (CPU or GPU) on which the model is loaded.
+            model: The pre-trained model loaded from the specified path in the config.
+
+        Methods:
+            setup(devices):
+                Loads the model onto the specified device(s) and sets it to evaluation mode.
+
+            decode_request(request, **kwargs) -> torch.Tensor:
+                Processes an uploaded image file, converts it to a tensor, and normalizes it.
+
+            batch(inputs: List[torch.Tensor]) -> torch.Tensor:
+                Combines a list of input tensors into a single batch tensor.
+
+            predict(x: torch.Tensor, **kwargs):
+                Performs prediction on the input tensor, logs metrics, and returns the predicted class and probabilities.
+
+            unbatch(output):
+                Splits the batched output into individual predictions and probabilities.
+
+            encode_response(output, **kwargs):
+                Formats the prediction output into a JSON-compatible response.
+
+            authorize(credentials: HTTPAuthorizationCredentials = Depends(security)):
+                Validates the provided authorization token against the configured API token.
+    """
     security = HTTPBearer()
 
     def setup(self, devices):
@@ -292,7 +366,8 @@ class CervicalCellClassifierAPI(ls.LitAPI):
         else:
             return process_prediction(predicted_label, probabilities)
 
-    def authorize(self, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    @staticmethod
+    def authorize(credentials: HTTPAuthorizationCredentials = Depends(security)):
         token = credentials.credentials
         if token != config.API_AUTH_TOKEN:
             raise HTTPException(status_code=401, detail="Invalid or missing token")
@@ -321,10 +396,11 @@ if __name__ == '__main__':
         retention="1 week",
         level="DEBUG"
     )
-
     try:
         api = CervicalCellClassifierAPI()
-        server = ls.LitServer(api, loggers=prometheus_logger)
+        server = ls.LitServer(api, api_path="/api/v1/predict", accelerator="auto",
+                              max_batch_size=4, timeout=1, track_requests=True,
+                              devices="auto", loggers=prometheus_logger)
 
         # Add the metrics endpoint
         server.app.mount("/api/v1/metrics", make_asgi_app(registry=registry))
@@ -339,3 +415,5 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"Server failed to start: {e}")
         sys.exit(1)
+
+

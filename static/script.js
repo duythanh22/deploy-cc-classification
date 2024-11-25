@@ -6,8 +6,8 @@ document.addEventListener('DOMContentLoaded', function() {
     const loadingIndicator = document.getElementById('loading');
     const resultsSection = document.getElementById('results');
     const errorSection = document.getElementById('error');
-    const maxFileSizeMB = 10; // Set the file size limit to 10MB
-    let chartInstance = null;  // Store chart instance to reset it later
+    const maxFileSizeMB = 10;
+    let chartInstance = null;
 
     form.addEventListener('submit', function(e) {
         e.preventDefault();
@@ -16,9 +16,15 @@ document.addEventListener('DOMContentLoaded', function() {
 
         // File size validation
         if (file && file.size > maxFileSizeMB * 1024 * 1024) {
-            errorSection.classList.remove('hidden');
-            errorSection.querySelector('p').textContent = `File size exceeds the 10MB limit. Please choose a smaller file.`;
-            return; // Stop the form submission
+            showError(`File size exceeds the 10MB limit. Please choose a smaller file.`);
+            return;
+        }
+
+        // File type validation
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg'];
+        if (file && !allowedTypes.includes(file.type)) {
+            showError(`Unsupported file type. Please upload a JPEG or PNG image.`);
+            return;
         }
 
         const formData = new FormData(form);
@@ -44,50 +50,98 @@ document.addEventListener('DOMContentLoaded', function() {
             method: 'POST',
             body: formData
         })
-        .then(response => response.json())
+        .then(response => {
+            if (!response.ok) {
+
+                if (response.status === 413) {
+                    throw new Error('Payload too large');
+                }
+                return response.json().then(err => {
+                    throw new Error(err.detail || 'Server error occurred');
+                });
+            }
+            return response.json();
+        })
         .then(data => {
             loadingIndicator.classList.add('hidden');
-            if (data.error) {
-                errorSection.classList.remove('hidden');
-                errorSection.querySelector('p').textContent = data.error;
+
+            if (!data || data.length === 0) {
+                throw new Error('No data received from server');
+            }
+
+            if (data.detail) {
+                throw new Error(data.detail);
+            }
+
+            const result = Array.isArray(data) ? data[0] : data;
+
+            if (result.error) {
+                showError(result.error);
+                return;
+            }
+
+            if (!result.predicted_class || !result.class_probabilities || !result.confidence_score) {
+                throw new Error('Invalid response format from server');
+            }
+
+            const classLabels = Object.keys(result.class_probabilities);
+            const probabilities = Object.values(result.class_probabilities);
+            const confidenceScore = result.confidence_score;
+            const confidenceThreshold = 0.6;
+
+            const predictionElement = document.getElementById('prediction');
+            const confidenceElement = document.getElementById('confidence');
+
+            predictionElement.textContent = result.predicted_class;
+            confidenceElement.textContent = `${(confidenceScore * 100).toFixed(2)}%`;
+
+            while (predictionElement.childNodes.length > 1) {
+                predictionElement.removeChild(predictionElement.lastChild);
+            }
+
+            if (confidenceScore < confidenceThreshold) {
+                predictionElement.style.color = 'red';
+                const annotation = document.createElement('p');
+                annotation.classList.add('text-sm', 'text-red-500', 'mt-2');
+                annotation.textContent = 'Warning: The confidence in this prediction is low (less than 60%). Please check the probabilities of all labels below.';
+                predictionElement.appendChild(annotation);
             } else {
-                // Extract keys and values from the class_probabilities object
-                const classLabels = Object.keys(data.class_probabilities);
-                const probabilities = Object.values(data.class_probabilities);
+                predictionElement.style.color = 'green';
+            }
 
-                const confidenceScore = data.confidence_score;  // Độ tự tin từ API
-                const confidenceThreshold = 0.6; // 60% confidence threshold
+            resultsSection.classList.remove('hidden');
 
-                const predictionElement = document.getElementById('prediction');
-                const confidenceElement = document.getElementById('confidence');
-
-                predictionElement.textContent = data.predicted_class;
-                confidenceElement.textContent = `${(confidenceScore * 100).toFixed(2)}%`;  // Sử dụng confidence_score từ API
-
-                if (confidenceScore < confidenceThreshold) {
-                    predictionElement.style.color = 'red';
-                    const annotation = document.createElement('p');
-                    annotation.classList.add('text-sm', 'text-red-500', 'mt-2');
-                    annotation.textContent = 'Warning: The confidence in this prediction is low (less than 60%). Please check the probabilities of all labels below.';
-                    predictionElement.appendChild(annotation);
-                } else {
-                    predictionElement.style.color = 'green';
-                }
-
-                resultsSection.classList.remove('hidden');
-
-                // Reset and draw the chart with actual data
+            if (typeof drawProbabilityChart === 'function') {
                 drawProbabilityChart(classLabels, probabilities);
             }
         })
-
         .catch(error => {
             loadingIndicator.classList.add('hidden');
-            errorSection.classList.remove('hidden');
-            errorSection.querySelector('p').textContent = 'An error occurred while processing your request.';
+            let errorMessage = 'An error occurred while processing your request.';
+
+            if (error.message.includes('Unsupported image format')) {
+                errorMessage = 'Please upload only JPEG or PNG images.';
+            } else if (error.message.includes('No data received')) {
+                errorMessage = 'No response received from the server. Please try again.';
+            } else if (error.message.includes('Invalid response format')) {
+                errorMessage = 'Server returned an invalid response format. Please try again.';
+            } else if (error.message.includes('Server error')) {
+                errorMessage = 'A server error occurred. Please try again later.';
+            } else if (error.message.includes('Payload too large')) {
+                errorMessage = 'The uploaded file is too large. Please choose a smaller file.';
+            }
+            showError(errorMessage);
             console.error('Error:', error);
         });
     });
+
+    // Helper function to show error messages
+    function showError(message) {
+        errorSection.classList.remove('hidden');
+        errorSection.querySelector('p').textContent = message;
+        loadingIndicator.classList.add('hidden');
+        resultsSection.classList.add('hidden');
+    }
 
     if (toggleButton && probabilitiesContent) {
         toggleButton.addEventListener('click', function() {
