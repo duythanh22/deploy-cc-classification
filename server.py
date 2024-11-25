@@ -17,6 +17,7 @@ import time
 import psutil
 import torch.cuda as cuda
 
+
 # Set the directory for multiprocess mode
 os.environ["PROMETHEUS_MULTIPROC_DIR"] = "/tmp/prometheus_multiproc_dir"
 
@@ -35,7 +36,6 @@ transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=config.IMAGE_MEAN, std=config.IMAGE_STD)
 ])
-
 
 class PrometheusLogger(litserve.Logger):
     def __init__(self):
@@ -149,7 +149,6 @@ class PrometheusLogger(litserve.Logger):
 
 class CervicalCellClassifierAPI(ls.LitAPI):
     security = HTTPBearer()
-
     def __init__(self):
         super().__init__()
         self.start_time = None
