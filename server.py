@@ -1,7 +1,6 @@
 import torch
 import PIL
 import os
-import logging
 from loguru import logger
 import litserve as ls
 from torchvision import transforms
@@ -10,11 +9,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from litserve.utils import PickleableHTTPException
 from litserve.middlewares import MaxSizeMiddleware
 from config.config import config
-from utils.callbacks import PredictTimeLogger
-from monitor.monitor import start_monitoring_server, monitor_requests
 from typing import List
 import sys
-from prometheus_client import CollectorRegistry, Histogram, Gauge, make_asgi_app, multiprocess
+from prometheus_client import CollectorRegistry, Histogram, Gauge, make_asgi_app, multiprocess, Counter
 import litserve
 import time
 import psutil
@@ -43,45 +40,150 @@ transform = transforms.Compose([
 class PrometheusLogger(litserve.Logger):
     def __init__(self):
         super().__init__()
-        # Existing histogram for request processing time
-        self.function_duration = Histogram("request_processing_seconds", "Time spent processing request",
-                                           ["function_name"], registry=registry)
 
-        # New Gauges for memory metrics
+        # Timing metrics
+        self.function_duration = Histogram(
+            "request_processing_seconds",
+            "Time spent processing request",
+            ["function_name"], registry=registry
+        )
+
+        # Request metrics
+        self.api_requests = Counter(
+            "api_requests_total",
+            "Total API requests handled",
+            ["endpoint", "method", "status"], registry=registry
+        )
+
+        self.api_response_time = Histogram(
+            "api_response_time_seconds",
+            "Response time of API endpoints",
+            ["endpoint"], registry=registry
+        )
+
+        # Model prediction metrics
+        self.model_predictions = Counter(
+            "model_predictions_total",
+            "Total number of model predictions",
+            ["predicted_class", "confidence_level"], registry=registry
+        )
+
         self.model_memory_usage = Gauge(
             "model_memory_usage_bytes",
             "Memory used by the model",
-            ["device_type"],
-            registry=registry
+            ["device_type"], registry=registry
         )
 
         self.system_memory_usage = Gauge(
             "system_memory_usage_bytes",
             "Overall system memory usage",
-            ["memory_type"],
-            registry=registry
+            ["memory_type"], registry=registry
+        )
+
+        self.cpu_usage = Gauge(
+            "cpu_usage_percent",
+            "CPU usage by the process and system",
+            ["cpu_type"], registry=registry
         )
 
     def process(self, key, value):
-        print("processing", key, value)
-        # Existing time processing
-        self.function_duration.labels(function_name=key).observe(value)
+        try:
+            logger.debug(f"Processing metric - Key: {key}, Value: {value}")
 
-        # Process memory metrics if they are memory-related
-        if key == "model_memory_allocated":
-            self.model_memory_usage.labels(device_type="gpu" if cuda.is_available() else "cpu").set(value)
-        elif key == "model_memory_peak":
-            self.model_memory_usage.labels(device_type="gpu_peak" if cuda.is_available() else "cpu_peak").set(value)
-        elif key == "system_memory_total":
-            self.system_memory_usage.labels(memory_type="total").set(value)
-        elif key == "system_memory_available":
-            self.system_memory_usage.labels(memory_type="available").set(value)
-        elif key == "system_memory_used":
-            self.system_memory_usage.labels(memory_type="used").set(value)
+            if key == "api_requests":
+                logger.debug(f"Logging API request metric: {value}")
+                self.api_requests.labels(
+                    endpoint=value["endpoint"],
+                    method=value["method"],
+                    status=value["status"]
+                ).inc()
+
+            elif key == "api_response_time":
+                logger.debug(f"Logging API response time: {value}")
+                self.api_response_time.labels(
+                    endpoint=value["endpoint"]
+                ).observe(value["duration"])
+
+            elif key == "model_prediction":
+                predicted_class, confidence = value
+                confidence_bucket = self._confidence_bucket(confidence)
+                logger.debug(f"Logging model prediction: {predicted_class}, Confidence bucket: {confidence_bucket}")
+                self.model_predictions.labels(
+                    predicted_class=predicted_class,
+                    confidence_level=confidence_bucket
+                ).inc()
+
+            elif key in {"model_memory_allocated", "model_memory_peak"}:
+                device_label = "gpu" if cuda.is_available() else "cpu"
+                logger.debug(f"Logging model memory usage: {key} = {value}, Device: {device_label}")
+                self.model_memory_usage.labels(device_type=device_label).set(value)
+
+            elif key.startswith("system_memory_"):
+                memory_type = key.split("_")[-1]
+                logger.debug(f"Logging system memory metric: {memory_type} = {value}")
+                self.system_memory_usage.labels(memory_type=memory_type).set(value)
+
+            elif key == "cpu_usage":
+                logger.debug(f"Logging CPU usage: {value}")
+                self.cpu_usage.labels(cpu_type="system").set(value["system"])
+                self.cpu_usage.labels(cpu_type="process").set(value["process"])
+
+            elif key == "inference_time":
+                logger.debug(f"Logging inference time: {value}")
+                self.function_duration.labels(function_name="predict").observe(value)
+
+            else:
+                logger.warning(f"Unrecognized key: {key}")
+        except Exception as e:
+            logger.error(f"Failed to process metric {key}: {value}, error: {e}")
+
+    def _confidence_bucket(self, confidence):
+        """Convert confidence to buckets"""
+        if confidence < 0.5:
+            return "low"
+        elif confidence < 0.8:
+            return "medium"
+        else:
+            return "high"
 
 
 class CervicalCellClassifierAPI(ls.LitAPI):
     security = HTTPBearer()
+
+    def __init__(self):
+        super().__init__()
+        self.start_time = None
+
+    async def __call__(self, request):
+        self.start_time = time.time()
+        try:
+            response = await super().__call__(request)
+            self.log_request_metrics(request, response.status_code)
+            return response
+        except Exception as e:
+            status_code = getattr(e, 'status_code', 500)
+            self.log_request_metrics(request, status_code)
+            logger.error(f"Exception occurred: {e}")
+            raise
+
+    def log_request_metrics(self, request, status_code):
+        try:
+            logger.debug(f"Logging API request metrics: {request.url.path}, {request.method}, {status_code}")
+            self.log("api_requests", {
+                "endpoint": request.url.path,
+                "method": request.method,
+                "status": status_code
+            })
+
+            if self.start_time:
+                response_time = time.time() - self.start_time
+                logger.debug(f"Logging API response time: {request.url.path}, {response_time}")
+                self.log("api_response_time", {
+                    "endpoint": request.url.path,
+                    "duration": response_time
+                })
+        except Exception as e:
+            logger.error(f"Error logging request metrics: {e}")
 
     def setup(self, devices):
         self.device = devices[0] if isinstance(devices, list) else devices
@@ -93,6 +195,42 @@ class CervicalCellClassifierAPI(ls.LitAPI):
             raise PickleableHTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
         self.model.eval()
 
+    def _start_system_metrics_collection(self):
+        import asyncio
+
+        async def collect_system_metrics():
+            while True:
+                try:
+                    logger.debug("Collecting system metrics...")
+                    process = psutil.Process(os.getpid())
+
+                    # Collect CPU metrics
+                    cpu_usage = {
+                        "system": psutil.cpu_percent(interval=1),
+                        "process": process.cpu_percent(interval=1)
+                    }
+                    self.log("cpu_usage", cpu_usage)
+
+                    # Collect memory metrics
+                    vm = psutil.virtual_memory()
+                    self.log("system_memory_total", vm.total)
+                    self.log("system_memory_available", vm.available)
+                    self.log("system_memory_used", vm.used)
+
+                    # Collect GPU metrics if available
+                    if cuda.is_available():
+                        allocated = cuda.memory_allocated(self.device)
+                        peak = cuda.max_memory_allocated(self.device)
+                        self.log("model_memory_allocated", allocated)
+                        self.log("model_memory_peak", peak)
+
+                except Exception as e:
+                    logger.error(f"Error collecting system metrics: {e}")
+
+                await asyncio.sleep(15)  # Collect every 15 seconds
+
+        asyncio.create_task(collect_system_metrics())
+
     def decode_request(self, request: UploadFile, **kwargs) -> torch.Tensor:
         try:
             image = PIL.Image.open(request.file)
@@ -103,7 +241,6 @@ class CervicalCellClassifierAPI(ls.LitAPI):
                                               detail=f"Unsupported image format: {file_ext}")
 
             image = image.convert("RGB")
-
             image = image.resize(config.IMAGE_INPUT_SIZE, PIL.Image.NEAREST)
 
             tensor_image = transforms.ToTensor()(image)
@@ -136,9 +273,8 @@ class CervicalCellClassifierAPI(ls.LitAPI):
             end_time = time.time()
             time_taken = end_time - start_time
 
-            # Memory usage tracking
+            # Memory and system metrics
             try:
-                # Model memory usage (GPU or CPU)
                 if cuda.is_available():
                     allocated = cuda.memory_allocated(self.device) / (1024 ** 3)  # Convert to GB
                     peak = cuda.max_memory_allocated(self.device) / (1024 ** 3)  # Convert to GB
@@ -146,45 +282,39 @@ class CervicalCellClassifierAPI(ls.LitAPI):
                     allocated = None
                     peak = None
 
-                # System memory usage
                 process = psutil.Process(os.getpid())
-                system_memory_total = psutil.virtual_memory().total
-                system_memory_available = psutil.virtual_memory().available
-                system_memory_used = psutil.virtual_memory().used
-                process_memory = process.memory_info().rss
+                cpu_usage = {
+                    "system": psutil.cpu_percent(interval=None),
+                    "process": process.cpu_percent(interval=None)
+                }
 
-                # Log memory metrics
-                if hasattr(self, "log"):
-                    if allocated is not None:
-                        self.log("model_memory_allocated",
-                                 allocated * (1024 ** 3))  # Convert back to bytes for Prometheus
-                        self.log("model_memory_peak", peak * (1024 ** 3))
+                self.log("cpu_usage", cpu_usage)
+                self.log("system_memory_total", psutil.virtual_memory().total)
+                self.log("system_memory_available", psutil.virtual_memory().available)
+                self.log("system_memory_used", psutil.virtual_memory().used)
 
-                    self.log("system_memory_total", system_memory_total)
-                    self.log("system_memory_available", system_memory_available)
-                    self.log("system_memory_used", system_memory_used)
-
-                # Logging for local debugging
-                logger.info(f"Prediction completed in {time_taken:.4f} seconds.")
-                if allocated is not None and peak is not None:
-                    logger.info(f"Model Memory usage - Allocated: {allocated:.2f} GB, Peak: {peak:.2f} GB")
-                logger.info(f"System Memory - Total: {system_memory_total / (1024 ** 3):.2f} GB, "
-                            f"Available: {system_memory_available / (1024 ** 3):.2f} GB, "
-                            f"Used: {system_memory_used / (1024 ** 3):.2f} GB")
-                logger.debug(f"Predicted labels: {predicted.tolist()}")
-                logger.debug(f"Probabilities: {probabilities.tolist()}")
-
-                # Log inference time
-                if hasattr(self, "log"):
-                    self.log("inference_time", time_taken)
+                if allocated is not None:
+                    self.log("model_memory_allocated", allocated * (1024 ** 3))  # Convert back to bytes
+                    self.log("model_memory_peak", peak * (1024 ** 3))
 
             except Exception as mem_err:
-                logger.warning(f"Failed to retrieve memory usage: {str(mem_err)}")
+                logger.warning(f"Failed to retrieve system metrics: {mem_err}")
+
+            # Log inference time
+            self.log("inference_time", time_taken)
+
+            # Log prediction metrics
+            predicted_class = config.CLASS_NAMES[predicted.item()]
+            confidence = probabilities[0][predicted.item()].item()
+            self.log("model_prediction", (predicted_class, confidence))
+
+            logger.info(f"Prediction completed in {time_taken:.4f} seconds")
+            logger.debug(f"Predicted class: {predicted_class}, Confidence: {confidence:.4f}")
 
             return predicted, probabilities
 
         except Exception as e:
-            logger.error(f"Error during prediction: {str(e)}")
+            logger.error(f"Error during prediction: {e}")
             raise PickleableHTTPException(status_code=500, detail="Prediction failed")
 
     def unbatch(self, output):
@@ -218,12 +348,18 @@ class CervicalCellClassifierAPI(ls.LitAPI):
     def authorize(self, credentials: HTTPAuthorizationCredentials = Depends(security)):
         token = credentials.credentials
         if token != config.API_AUTH_TOKEN:
+            logger.warning("Invalid or missing token")
             raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 
 if __name__ == '__main__':
+    # Clean up old metric files
+    multiprocess_dir = "/tmp/prometheus_multiproc_dir"
+    if os.path.exists(multiprocess_dir):
+        for file in os.listdir(multiprocess_dir):
+            os.remove(os.path.join(multiprocess_dir, file))
     prometheus_logger = PrometheusLogger()
-    # prometheus_logger.mount(path="/api/v1/metrics", app=make_asgi_app(registry=registry))
+
     # Configure logging
     logger.remove()
     logger.add(
@@ -238,6 +374,7 @@ if __name__ == '__main__':
         retention="1 week",
         level="DEBUG"
     )
+
     try:
         api = CervicalCellClassifierAPI()
         server = ls.LitServer(api, loggers=prometheus_logger)
