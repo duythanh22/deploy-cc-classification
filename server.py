@@ -17,7 +17,6 @@ import time
 import psutil
 import torch.cuda as cuda
 
-
 # Set the directory for multiprocess mode
 os.environ["PROMETHEUS_MULTIPROC_DIR"] = "/tmp/prometheus_multiproc_dir"
 
@@ -36,6 +35,7 @@ transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=config.IMAGE_MEAN, std=config.IMAGE_STD)
 ])
+
 
 class PrometheusLogger(litserve.Logger):
     def __init__(self):
@@ -88,54 +88,31 @@ class PrometheusLogger(litserve.Logger):
 
     def process(self, key, value):
         try:
-            logger.debug(f"Processing metric - Key: {key}, Value: {value}")
-
-            if key == "api_requests":
-                logger.debug(f"Logging API request metric: {value}")
-                self.api_requests.labels(
-                    endpoint=value["endpoint"],
-                    method=value["method"],
-                    status=value["status"]
-                ).inc()
-
-            elif key == "api_response_time":
-                logger.debug(f"Logging API response time: {value}")
-                self.api_response_time.labels(
-                    endpoint=value["endpoint"]
-                ).observe(value["duration"])
-
-            elif key == "model_prediction":
-                predicted_class, confidence = value
+            # Log processing based on the key
+            if key == "model_prediction":
+                predicted_class, confidence = value  # Unpack the tuple
                 confidence_bucket = self._confidence_bucket(confidence)
-                logger.debug(f"Logging model prediction: {predicted_class}, Confidence bucket: {confidence_bucket}")
+
+                # Increment the Counter by 1
                 self.model_predictions.labels(
                     predicted_class=predicted_class,
                     confidence_level=confidence_bucket
-                ).inc()
-
-            elif key in {"model_memory_allocated", "model_memory_peak"}:
-                device_label = "gpu" if cuda.is_available() else "cpu"
-                logger.debug(f"Logging model memory usage: {key} = {value}, Device: {device_label}")
-                self.model_memory_usage.labels(device_type=device_label).set(value)
-
+                ).inc(1)
+            elif key == "model_memory_allocated":
+                self.model_memory_usage.labels(device_type="gpu" if cuda.is_available() else "cpu").set(value)
+            elif key == "model_memory_peak":
+                self.model_memory_usage.labels(device_type="gpu_peak" if cuda.is_available() else "cpu_peak").set(value)
             elif key.startswith("system_memory_"):
                 memory_type = key.split("_")[-1]
-                logger.debug(f"Logging system memory metric: {memory_type} = {value}")
                 self.system_memory_usage.labels(memory_type=memory_type).set(value)
-
             elif key == "cpu_usage":
-                logger.debug(f"Logging CPU usage: {value}")
                 self.cpu_usage.labels(cpu_type="system").set(value["system"])
                 self.cpu_usage.labels(cpu_type="process").set(value["process"])
-
-            elif key == "inference_time":
-                logger.debug(f"Logging inference time: {value}")
-                self.function_duration.labels(function_name="predict").observe(value)
-
             else:
-                logger.warning(f"Unrecognized key: {key}")
+                self.function_duration.labels(function_name=key).observe(value)
         except Exception as e:
-            logger.error(f"Failed to process metric {key}: {value}, error: {e}")
+            logger.error(
+                f"PrometheusLogger ran into an error while processing log for key {key} and value {value}: {e}")
 
     def _confidence_bucket(self, confidence):
         """Convert confidence to buckets"""
@@ -146,43 +123,8 @@ class PrometheusLogger(litserve.Logger):
         else:
             return "high"
 
-
 class CervicalCellClassifierAPI(ls.LitAPI):
     security = HTTPBearer()
-    def __init__(self):
-        super().__init__()
-        self.start_time = None
-
-    async def __call__(self, request):
-        self.start_time = time.time()
-        try:
-            response = await super().__call__(request)
-            self.log_request_metrics(request, response.status_code)
-            return response
-        except Exception as e:
-            status_code = getattr(e, 'status_code', 500)
-            self.log_request_metrics(request, status_code)
-            logger.error(f"Exception occurred: {e}")
-            raise
-
-    def log_request_metrics(self, request, status_code):
-        try:
-            logger.debug(f"Logging API request metrics: {request.url.path}, {request.method}, {status_code}")
-            self.log("api_requests", {
-                "endpoint": request.url.path,
-                "method": request.method,
-                "status": status_code
-            })
-
-            if self.start_time:
-                response_time = time.time() - self.start_time
-                logger.debug(f"Logging API response time: {request.url.path}, {response_time}")
-                self.log("api_response_time", {
-                    "endpoint": request.url.path,
-                    "duration": response_time
-                })
-        except Exception as e:
-            logger.error(f"Error logging request metrics: {e}")
 
     def setup(self, devices):
         self.device = devices[0] if isinstance(devices, list) else devices
@@ -194,42 +136,6 @@ class CervicalCellClassifierAPI(ls.LitAPI):
             raise PickleableHTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
         self.model.eval()
 
-    def _start_system_metrics_collection(self):
-        import asyncio
-
-        async def collect_system_metrics():
-            while True:
-                try:
-                    logger.debug("Collecting system metrics...")
-                    process = psutil.Process(os.getpid())
-
-                    # Collect CPU metrics
-                    cpu_usage = {
-                        "system": psutil.cpu_percent(interval=1),
-                        "process": process.cpu_percent(interval=1)
-                    }
-                    self.log("cpu_usage", cpu_usage)
-
-                    # Collect memory metrics
-                    vm = psutil.virtual_memory()
-                    self.log("system_memory_total", vm.total)
-                    self.log("system_memory_available", vm.available)
-                    self.log("system_memory_used", vm.used)
-
-                    # Collect GPU metrics if available
-                    if cuda.is_available():
-                        allocated = cuda.memory_allocated(self.device)
-                        peak = cuda.max_memory_allocated(self.device)
-                        self.log("model_memory_allocated", allocated)
-                        self.log("model_memory_peak", peak)
-
-                except Exception as e:
-                    logger.error(f"Error collecting system metrics: {e}")
-
-                await asyncio.sleep(15)  # Collect every 15 seconds
-
-        asyncio.create_task(collect_system_metrics())
-
     def decode_request(self, request: UploadFile, **kwargs) -> torch.Tensor:
         try:
             image = PIL.Image.open(request.file)
@@ -240,6 +146,7 @@ class CervicalCellClassifierAPI(ls.LitAPI):
                                               detail=f"Unsupported image format: {file_ext}")
 
             image = image.convert("RGB")
+
             image = image.resize(config.IMAGE_INPUT_SIZE, PIL.Image.NEAREST)
 
             tensor_image = transforms.ToTensor()(image)
@@ -347,7 +254,6 @@ class CervicalCellClassifierAPI(ls.LitAPI):
     def authorize(self, credentials: HTTPAuthorizationCredentials = Depends(security)):
         token = credentials.credentials
         if token != config.API_AUTH_TOKEN:
-            logger.warning("Invalid or missing token")
             raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 
@@ -358,7 +264,7 @@ if __name__ == '__main__':
         for file in os.listdir(multiprocess_dir):
             os.remove(os.path.join(multiprocess_dir, file))
     prometheus_logger = PrometheusLogger()
-
+    # prometheus_logger.mount(path="/api/v1/metrics", app=make_asgi_app(registry=registry))
     # Configure logging
     logger.remove()
     logger.add(
@@ -373,7 +279,6 @@ if __name__ == '__main__':
         retention="1 week",
         level="DEBUG"
     )
-
     try:
         api = CervicalCellClassifierAPI()
         server = ls.LitServer(api, loggers=prometheus_logger)
@@ -386,4 +291,3 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"Server failed to start: {e}")
         sys.exit(1)
-
